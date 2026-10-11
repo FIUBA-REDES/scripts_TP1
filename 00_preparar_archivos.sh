@@ -12,7 +12,12 @@ FILES_DIR="./archivos_prueba"
 STORAGE_DIR="${TP1_DIR}/storage"
 RECIBIDOS_DIR="./recibidos"
 
-echo "=== Preparando entorno de archivos de prueba ==="
+echo "=== Preparando entorno y archivos de prueba ==="
+
+if ! command -v xterm >/dev/null 2>&1; then
+    echo "[*] Instalando xterm..."
+    sudo apt-get update && sudo apt-get install -y xterm
+fi
 
 mkdir -p "${FILES_DIR}"
 mkdir -p "${STORAGE_DIR}"

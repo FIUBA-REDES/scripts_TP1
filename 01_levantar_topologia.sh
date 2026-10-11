@@ -28,7 +28,7 @@ sudo mn -c
 if [ $# -eq 0 ]; then
     echo "=== [Prueba 1] Levantando topología custom desde ../TP1/src/lib/topologia.py ==="
     echo "    (5 hosts: h1..h4 clientes [10.0.0.1..4], h5 servidor [10.0.0.5], RTT=40ms, ~10% loss)"
-    sudo mn --custom ../TP1/src/lib/topologia.py --topo mytopo --mac
+    sudo mn --custom ../TP1/src/lib/topologia.py --topo mytopo --mac #ver si  lo levantamos sin el .py
 else
     echo "=== [Prueba 6] Levantando topología con nuevas condiciones de red ==="
     echo "    Delay por enlace: ${DELAY_ENLACE} | Loss por enlace: ${LOSS_ENLACE}%"

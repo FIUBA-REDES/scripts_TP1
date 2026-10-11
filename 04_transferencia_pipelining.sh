@@ -7,7 +7,7 @@
 #   - Calcula e imprime la estimación teórica vs observada de paquetes y retransmisiones.
 #   - Verifica integridad mediante comparación de hashes MD5.
 #
-# Uso (ejecutar desde un cliente en Mininet, ej. h1):
+# Ejecutar desde la xterm de un cliente en Mininet (ej: mininet> xterm h1):
 #   ./04_transferencia_pipelining.sh 5MB upload     # Prueba 3 y 4 (5 MB < 2 min)
 #   ./04_transferencia_pipelining.sh 1MB upload     # Prueba 7 (1 MB con nuevo delay)
 #   ./04_transferencia_pipelining.sh 5MB download   # Variante descargando 5 MB
@@ -128,7 +128,7 @@ echo "--- [5] Verificación de Integridad (MD5) ---"
 HASH_ORIG=$(md5sum "${ARCHIVO_ORIGEN}" | awk '{print $1}')
 HASH_DEST=$(md5sum "${ARCHIVO_FINAL}" | awk '{print $1}')
 
-echo "MD5 Original   (${ARCHIVO_ORIGEN}): ${HASH_ORIG}"
+echo "MD5 Original    (${ARCHIVO_ORIGEN}): ${HASH_ORIG}"
 echo "MD5 Transferido (${ARCHIVO_FINAL}): ${HASH_DEST}"
 
 if [ "${HASH_ORIG}" = "${HASH_DEST}" ]; then
@@ -137,4 +137,3 @@ else
     echo "[ERROR] Los hashes NO coinciden."
     exit 1
 fi
-
