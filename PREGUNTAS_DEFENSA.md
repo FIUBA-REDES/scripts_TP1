@@ -166,3 +166,75 @@ sequenceDiagram
 
 *(Nota adicional por si te preguntan la diferencia con **DOWNLOAD**: en un `UPLOAD` todos los paquetes viajan por el puerto `5005` del servidor encolados en `Session.packets`, mientras que en un `DOWNLOAD` el cliente envía `OP_START` con payload `"DOWNLOAD:sack:archivo.bin"` al puerto `5005` y el servidor lanza `_worker_task` en el `ThreadPoolExecutor` creando un `sender_transport = UdpTransport()` nuevo con su propio socket efímero para transmitirle los `OP_DATA` al cliente sin competir por lecturas del socket `5005`).*
 
+
+---
+
+## 7. ¿Cómo funciona la concurrencia en el TP?
+
+La concurrencia está implementada en el servidor ([`file_transfer_server.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/file_transfer_server.py) y [`session.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/session.py)) combinando un **hilo receptor central (demultiplexor)**, un **pool de hilos trabajadores (`ThreadPoolExecutor`)** y dos estrategias diferenciadas según la operación sea **UPLOAD** o **DOWNLOAD**:
+
+### 1. Identificación de clientes y tabla de sesiones (`self.sessions`)
+- Como UDP no es orientado a conexión, todos los clientes envían su primer paquete (`OP_START`) al mismo socket del servidor (`10.0.0.5:5005`).
+- El servidor identifica unívocamente a cada flujo cliente por su tupla **`client_address = (ip_cliente, puerto_efimero_UDP)`** y lo registra en el diccionario `self.sessions[client_address] = client_session`.
+- El acceso a `self.sessions` está protegido por un **`threading.Lock()` (`self.lock`)** ([`file_transfer_server.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/file_transfer_server.py#L19)) para evitar condiciones de carrera (*race conditions*) cuando un hilo principal agrega sesiones y un hilo trabajador las elimina al abortar (`_cleanup_session`).
+
+### 2. Concurrencia en UPLOADs: Patrón Productor-Consumidor con `queue.Queue`
+- En un **UPLOAD**, todos los paquetes `OP_DATA` de todos los clientes llegan al único socket del servidor en el puerto `5005`.
+- Si varios hilos hicieran `recvfrom()` directamente sobre el mismo socket `5005`, se robarían los paquetes entre sí.
+- **Solución implementada**:
+  1. **Un único hilo productor (`serve_forever`)** lee del socket `5005` con `self.transport.receive()`.
+  2. Busca `client_address` en `self.sessions` y **encola el paquete** en la cola privada de ese cliente: `self.sessions[client_address].enqueue(packet)` (que internamente usa `queue.Queue()`, la cual es *thread-safe*).
+  3. **Un hilo consumidor por sesión (`Session.process_packets`)** corre en paralelo dentro del `ThreadPoolExecutor(max_workers=10)`, sacando paquetes de su propia cola (`self.packets.get(timeout=5)`), ordenándolos en su propio diccionario `self.chunks`, ensamblando en su `self.buffer` y enviando los `OP_ACK` de vuelta.
+
+### 3. Concurrencia en DOWNLOADs: Socket efímero dedicado por transferencia (`_worker_task`)
+- En un **DOWNLOAD**, el servidor pasa a ser el **emisor** (`StopAndWait.send` o `SelectiveRepeat.send`), por lo que necesita hacer `receive()` constantemente para leer los `OP_ACK` que le devuelve el cliente.
+- Si el hilo de download leyera del socket principal `5005`, competiría con `serve_forever()` y consumiría por error paquetes de otros clientes.
+- **Solución implementada** ([`file_transfer_server.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/file_transfer_server.py#L147-L158)):
+  - El servidor responde el `OP_ACK` del handshake inicial por el puerto `5005` y lanza `_worker_task` en el `ThreadPoolExecutor`.
+  - `_worker_task` **crea una nueva instancia `sender_transport = UdpTransport(timeout=1.0)`**, a la cual el sistema operativo le asigna un **puerto UDP efímero exclusivo** para esa descarga.
+  - Del lado del cliente ([`stop_and_wait.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/stop_and_wait.py#L108-L111) y [`sack.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/sack.py#L65)), al recibir el primer `OP_DATA`, el cliente valida que la IP origen sea la del servidor (`address[0] == expected_address[0]`) y **actualiza `server_address = address`** al nuevo puerto efímero del hilo trabajador. A partir de ahí, todo el intercambio `OP_DATA <-> OP_ACK` de ese download ocurre por ese socket dedicado, 100% aislado del resto de los clientes.
+
+---
+
+## 8. ¿Cómo son ambos protocolos y en qué se diferencian?
+
+Ambos protocolos implementan **transferencia confiable sobre UDP** usando el mismo formato de paquete de 11 bytes de header ([`protocol.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/protocol.py)), el mismo tamaño de bloque (`CHUNK_SIZE = 1024` bytes) y las mismas 3 fases (`OP_START`, `OP_DATA`, `OP_FIN`), pero difieren radicalmente en cómo manejan el envío y la recuperación ante pérdidas:
+
+| Característica | Stop & Wait (`sw` - [`stop_and_wait.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/stop_and_wait.py)) | Selective Repeat / SACK (`sack` - [`sack.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/sack.py)) |
+| :--- | :--- | :--- |
+| **Pipelining / Ventana** | **Sin pipelining** (ventana efectiva = 1 paquete). No envía el paquete $i+1$ hasta recibir el `OP_ACK` del paquete $i$. | **Con pipelining** (`WINDOW_SIZE = 32` paquetes = 32 KB en vuelo sin esperar confirmación). |
+| **Uso del canal (Throughput)** | Muy bajo cuando hay RTT alto: por cada paquete de 1 KB espera al menos 1 RTT (40 ms). Para 5 MB (5120 paquetes) tardaría $> 200$ segundos solo en tiempo de propagación. | Alto aprovechamiento del enlace: envía ráfagas de hasta 32 paquetes por RTT, completando los 5 MB con 10% de pérdida en pocos segundos ($< 2$ min). |
+| **Tipo de ACK** | **Individual**: el `OP_ACK` confirma únicamente el `seq_num` recién recibido (`ack_num == seq_num`, payload vacío). | **Acumulativo + Selectivo (SACK)**: `ack_num` indica el próximo `seq` en orden esperado (confirmando todos los `< ack_num`) y el `payload` lista los `seq` mayores ya recibidos fuera de orden. |
+| **Recepción fuera de orden** | No puede ocurrir que avance la secuencia sin confirmar el anterior; si llega un duplicado viejo (`seq < expected_seq`), solo reenvía su ACK. | **Buffer de recepción (`chunks`)**: si se pierde el paquete 5, el receptor guarda en memoria los paquetes $6, 7, \dots, 36$ y avisa por SACK que ya los tiene. Cuando llega el 5, entrega del 5 al 36 juntos. |
+| **Manejo de Timeout** | Bloqueante en el socket (`socket.settimeout(1.0)`). | No bloqueante / polling corto con `select.select` (`20 ms`) + timestamp individual `'time_sent'` por paquete (`RTO = 0.5s`). |
+| **Retransmisión** | Si vence el timeout (o se pierde el ACK), retransmite el único paquete actual (hasta `MAX_TRIES = 5`). | **Selectiva**: al vencer el `RTO` de un paquete, solo se retransmite si `'sacked' == False` (hasta `MAX_TRIES = 12`), evitando reenviar paquetes que ya llegaron. |
+
+---
+
+## 9. ¿Qué decisiones de arquitectura y diseño tomaron, y por qué?
+
+1. **Encapsulamiento de la red en `UdpTransport` ([`transport.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/transport.py))**:
+   - **Qué hicimos**: Separamos las llamadas de bajo nivel de `socket` (`sendto`, `recvfrom`, `bind`, `settimeout`) y la serialización (`Packet.encode()` / `Packet.decode()`) en la clase `UdpTransport`.
+   - **Por qué**: Permitió desacoplar los algoritmos de los protocolos (`StopAndWait` y `SelectiveRepeat`) del socket real. Gracias a esto pudimos inyectar transportes simulados (*mocks*) en los tests unitarios de `tests/` sin necesitar abrir puertos reales ni levantar Mininet para testear pérdidas de paquetes.
+
+2. **Protocolo binario propio de cabecera fija de 11 bytes ([`protocol.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/protocol.py))**:
+   - **Qué hicimos**: Diseñamos un header compacto en *big-endian* de 11 bytes: `Opcode (1B) + Seq (4B) + Ack (4B) + Payload_Len (2B)`.
+   - **Por qué**:
+     - Tiene muy bajo overhead (11 bytes frente a 1024 bytes de datos $\approx 1\%$).
+     - `Seq` y `Ack` de 4 bytes (`uint32`) permiten hasta $4 \times 10^9$ bloques de 1 KB ($\approx 4\text{ TB}$), evitando cualquier problema de *wrap-around* de números de secuencia en archivos grandes.
+     - El campo `Payload_Len` (2 bytes) permite validar en `Packet.decode()` que el datagrama UDP no haya llegado truncado y permite transportar la lista variable de números de secuencia SACK en los paquetes `OP_ACK`.
+     - Además, facilitó escribir el disector en Lua para Wireshark ([`mi_plugin.lua`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/mi_plugin.lua)) leyendo posiciones fijas del buffer.
+
+3. **Tamaño de bloque `CHUNK_SIZE = 1024` bytes**:
+   - **Por qué**: El MTU estándar de Ethernet es de **1500 bytes**. Con `1024 bytes` de payload + `11 bytes` de header propio + `8 bytes` UDP + `20 bytes` IP = **1063 bytes**, nos mantenemos holgadamente por debajo del MTU de 1500 bytes (incluso si el ACK llevara 32 bloques SACK de 4 bytes = 128 bytes), **evitando por completo la fragmentación IP** (que multiplicaría la probabilidad de pérdida de paquetes en enlaces ruidosos).
+
+4. **Arquitectura híbrida en el Servidor (Cola por sesión para UPLOAD + Socket efímero para DOWNLOAD)**:
+   - **Por qué**: En UDP todos los clientes contactan inicialmente al puerto `5005`. Para **UPLOAD**, centralizar el `recvfrom()` en el hilo principal y despachar a colas `queue.Queue` por sesión (`Session`) evita que múltiples hilos bloqueen o compitan sobre el mismo socket `5005`. En cambio, para **DOWNLOAD**, abrir un `UdpTransport` nuevo con un puerto efímero dentro del worker thread permite reutilizar exactamente el mismo método estático `StopAndWait.send()` y `SelectiveRepeat.send()` que usa el cliente en el upload, sin duplicar código de envío y sin interferir con el socket principal del servidor.
+
+5. **Recepción unificada en el Servidor (`Session` soporta ambos protocolos transparentemente)**:
+   - **Qué hicimos**: En [`session.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/session.py), cuando un cliente hace un UPLOAD, el servidor usa siempre la misma lógica de `Session.update_session()` tanto si el cliente transmite con Stop & Wait como con SACK.
+   - **Por qué**: Un receptor Selective Repeat que envía ACKs con `seq_num` confirmado, `ack_num` acumulativo (`self.next_seq`) y payload SACK es **totalmente retrocompatible** con un emisor Stop & Wait (ya que cuando los paquetes llegan en orden de a uno, `chunks` está vacío, el payload SACK va vacío y `seq_num` coincide con el paquete confirmado). Esto simplificó el servidor sin necesitar dos clases de sesión distintas para Upload.
+
+6. **Período de gracia en el cierre (`FIN_GRACE_PERIOD` / espera post-FIN en el receptor)**:
+   - **Qué hicimos**: Tanto en `StopAndWait.receive()` ([`stop_and_wait.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/stop_and_wait.py#L136-L148)) como en `SelectiveRepeat.retry_reply_fin_ack()` ([`sack.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/sack.py#L185-L194)), después de recibir el `OP_FIN` y mandar su `OP_ACK`, el receptor no cierra inmediatamente sino que escucha brevemente por si llega un `OP_FIN` retransmitido.
+   - **Por qué**: Es el equivalente al estado **`TIME_WAIT` de TCP**. Con 10% de pérdida de paquetes, existe un 10% de probabilidad de que el último `OP_ACK` del `OP_FIN` se pierda en la red. Si el receptor cerrara el socket enseguida, el emisor reintentaría enviar el `OP_FIN` hasta agotar `MAX_TRIES` y daría la transferencia por fallida aunque el archivo ya se hubiera escrito completo en disco.
