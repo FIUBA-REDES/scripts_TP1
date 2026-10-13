@@ -676,3 +676,71 @@ classDiagram
    - Representa el estado de una transferencia de subida (*UPLOAD*) de un cliente específico.
    - Tiene su propia cola interna de paquetes `self.packets = Queue()`.
    - Su método `process_packets()` corre en un hilo de trabajo separado, consumiendo de la cola, manteniendo el estado de ensamblado (`self.chunks` y `self.buffer`), respondiendo los `OP_ACK` y persistiendo el archivo final en disco al recibir el `OP_FIN`.
+   - 
+---
+
+## 13. ¿La concurrencia se maneja de manera distinta en Upload y Download? ¿Por qué?
+
+**Sí, se maneja de manera completamente distinta.** La razón de fondo es la **asimetría del rol del servidor** (en Upload el servidor es *receptor* de datos masivos, mientras que en Download es *emisor* de datos masivos) sumado al hecho de que **UDP no crea un socket nuevo por conexión** como sí hace TCP con `accept()`.
+
+---
+
+### A. ¿Cómo se maneja en UPLOAD? (Demultiplexación + Cola privada por cliente)
+
+```text
+Cliente 1 (OP_DATA) ──┐
+Cliente 2 (OP_DATA) ──┼──> Socket 5005 ──> serve_forever() ──┬──> Queue 1 ──> Worker 1 (Session 1)
+Cliente 3 (OP_DATA) ──┘   (Hilo Principal Demux)             ├──> Queue 2 ──> Worker 2 (Session 2)
+                                                             └──> Queue 3 ──> Worker 3 (Session 3)
+```
+
+1. **Flujo de paquetes**:
+   - Todos los clientes envían sus paquetes `OP_DATA` y `OP_FIN` dirigidos al **único socket conocido del servidor**: `10.0.0.5:5005`.
+2. **Mecanismo de concurrencia**:
+   - **Hilo Principal (`serve_forever`)**: es el **único** que hace `self.transport.receive()` sobre el socket `5005`. Al recibir un datagrama, mira la tupla `client_address = (IP, puerto)` y busca su sesión en el diccionario `self.sessions`.
+   - **Colas `queue.Queue`**: el hilo principal no procesa los datos ni escribe a disco; simplemente hace `self.sessions[client_address].enqueue(packet)`.
+   - **Hilos de trabajo (`Session.process_packets`)**: cada cliente tiene un hilo asignado en el `ThreadPoolExecutor(max_workers=10)` que consume exclusivamente de su cola local (`self.packets.get(timeout=5)`), arma el archivo en su buffer y responde los `OP_ACK` hacia ese cliente.
+3. **¿Por qué se diseñó así para Upload?**:
+   - Si cada hilo de sesión intentara hacer `recvfrom()` directamente sobre el socket `5005`, ocurriría una **condición de carrera destructiva**: el hilo de la Sesión A consumiría paquetes del Cliente B, mezclando o descartando chunks de archivos distintos. El hilo principal actúa como **demultiplexor centralizado**.
+
+---
+
+### B. ¿Cómo se maneja en DOWNLOAD? (Socket UDP Efímero dedicado por cliente)
+
+```text
+1. Handshake inicial:
+   Cliente (DOWNLOAD) ──> Socket 5005 (Handshake OP_START) ──> Responde OP_ACK y lanza Worker
+
+2. Transferencia de datos:
+   Worker (Download 1) ──> Abre Socket Efímero A (ej. 45123) ──> OP_DATA / OP_ACK con Cliente 1
+   Worker (Download 2) ──> Abre Socket Efímero B (ej. 45124) ──> OP_DATA / OP_ACK con Cliente 2
+   (El socket 5005 queda 100% libre para recibir nuevos clientes)
+```
+
+1. **Flujo de paquetes**:
+   - El cliente envía un `OP_START` con payload `"DOWNLOAD:<proto>:<archivo>"` al puerto `5005`.
+   - El servidor responde el `OP_ACK` confirmando el inicio de la sesión por el puerto `5005`.
+   - Inmediatamente después, el servidor despacha la función `_worker_task` al `ThreadPoolExecutor` ([`file_transfer_server.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/file_transfer_server.py#L147-L158)).
+2. **Mecanismo de concurrencia**:
+   - Adentro de `_worker_task`, el servidor **crea un socket UDP nuevo**:
+     ```python
+     sender_transport = UdpTransport(timeout=1.0)
+     ```
+   - El sistema operativo le asigna a este socket un **puerto efímero libre** (por ejemplo, `45123`).
+   - El worker ejecuta `StopAndWait.send(sender_transport, ...)` o `SelectiveRepeat.send(sender_transport, ...)`.
+   - El cliente, al recibir el primer `OP_DATA`, detecta que la IP es la del servidor pero el puerto cambió (`address != server_address`), y actualiza su destino a ese nuevo socket ([`sack.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/sack.py#L214)).
+3. **¿Por qué se diseñó así para Download?**:
+   - En una descarga, el servidor es el que **envía datos y espera ACKs**. Los métodos `StopAndWait.send` y `SelectiveRepeat.send` necesitan hacer `recvfrom()` bloqueante o con polling para leer los `OP_ACK` que envía el cliente.
+   - Si el worker de download leyera del socket `5005`, competiría directamente con el hilo `serve_forever()` por los datagramas entrantes, "robándole" paquetes `OP_START` o `OP_DATA` de otros clientes que estén subiendo archivos.
+   - Al crear un **socket efímero dedicado**, cada descarga tiene su propio canal bidireccional completamente aislado del socket `5005` y de los demás clientes.
+
+---
+
+### Cuadro comparativo resumen
+
+| Criterio | En UPLOAD | En DOWNLOAD |
+| :--- | :--- | :--- |
+| **Rol del Servidor** | **Receptor** de datos (recibe `OP_DATA`, envía `OP_ACK`). | **Emisor** de datos (envía `OP_DATA`, recibe `OP_ACK`). |
+| **Socket utilizado** | El socket principal compartido **`10.0.0.5:5005`**. | Un socket con **puerto efímero dedicado** por cada descarga (`sender_transport = UdpTransport()`). |
+| **Paso de paquetes** | Hilo central `serve_forever()` encola en `Session.packets` (`Queue`). | Directo: el socket efímero solo recibe los ACKs de su respectivo cliente. |
+| **Razón fundamental** | Evita que múltiples hilos compitan en `recvfrom()` sobre el puerto 5005 al recibir datos. | Evita que el bucle de envío/espera de ACKs interfiera con el socket de escucha 5005 del servidor. |
