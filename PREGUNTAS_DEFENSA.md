@@ -238,3 +238,63 @@ Ambos protocolos implementan **transferencia confiable sobre UDP** usando el mis
 6. **Período de gracia en el cierre (`FIN_GRACE_PERIOD` / espera post-FIN en el receptor)**:
    - **Qué hicimos**: Tanto en `StopAndWait.receive()` ([`stop_and_wait.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/stop_and_wait.py#L136-L148)) como en `SelectiveRepeat.retry_reply_fin_ack()` ([`sack.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/sack.py#L185-L194)), después de recibir el `OP_FIN` y mandar su `OP_ACK`, el receptor no cierra inmediatamente sino que escucha brevemente por si llega un `OP_FIN` retransmitido.
    - **Por qué**: Es el equivalente al estado **`TIME_WAIT` de TCP**. Con 10% de pérdida de paquetes, existe un 10% de probabilidad de que el último `OP_ACK` del `OP_FIN` se pierda en la red. Si el receptor cerrara el socket enseguida, el emisor reintentaría enviar el `OP_FIN` hasta agotar `MAX_TRIES` y daría la transferencia por fallida aunque el archivo ya se hubiera escrito completo en disco.
+
+---
+
+## 10. ¿Qué hace su extensión de Lua, cómo lo hace, y por qué la diseñaron así?
+
+Nuestra extensión es un **disector de Wireshark escrito en Lua** ([`../TP1/src/lib/mi_plugin.lua`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/mi_plugin.lua)) que decodifica y muestra en vivo el tráfico de nuestro protocolo sobre el puerto UDP `5005`.
+
+---
+
+### A. ¿Qué hace la extensión?
+1. **Decodifica el encabezado de 11 bytes**:
+   - `Opcode` (1 byte): traduce numéricamente `0 -> START`, `1 -> DATA`, `2 -> ACK`, `3 -> FIN`, `4 -> ERROR`.
+   - `Sequence Number` (4 bytes, `uint32`).
+   - `Acknowledgment Number` (4 bytes, `uint32`).
+   - `Payload Length` (2 bytes, `uint16`).
+2. **Distingue e identifica automáticamente la variante del protocolo**: muestra en la columna de protocolo de Wireshark si el flujo es **`STOPWAIT`** o **`SACK`**.
+3. **Desglosa la lista SACK**: cuando un `OP_ACK` trae secuencias fuera de orden en su payload (múltiplos de 4 bytes), crea un subárbol en Wireshark (`Lista SACK: X paquete(s) recibido(s) fuera de orden`) e individualiza cada número de secuencia recibido.
+4. **Formatea la columna de Información (`Info`)**: resume en una sola línea legible el tipo de paquete y sus parámetros: `DATA  Seq=12  Ack=0  Len=1024` o `ACK  Seq=15  Ack=12  Len=8  SACK=[14,15]`.
+5. **Muestra advertencias diagnósticas (*Expert Info*)**: resalta en rojo/amarillo si llega un opcode inválido o si el tamaño declarado en `payload_len` no coincide con los bytes reales del datagrama UDP.
+
+---
+
+### B. ¿Cómo lo hace técnicamente?
+1. **Registro sobre UDP 5005**:
+   - Se crea el protocolo con `sw = Proto("stopwait", "Protocolo Stop and Wait / SACK")` y al final del script se asocia al puerto con:
+     ```lua
+     local udp_table = DissectorTable.get("udp.port")
+     udp_table:add(5005, sw)
+     ```
+2. **Identificación de flujos bidireccionales (`flow_key`)**:
+   - Para relacionar paquetes en ambos sentidos (cliente $\leftrightarrow$ servidor), arma una clave normalizada ordenando las tuplas `(IP:puerto)`:
+     ```lua
+     local a = tostring(pinfo.src) .. ":" .. tostring(pinfo.src_port)
+     local b = tostring(pinfo.dst) .. ":" .. tostring(pinfo.dst_port)
+     local key = (a < b) and (a .. "|" .. b) or (b .. "|" .. a)
+     ```
+3. **Detección automática de variante (`update_evidence`)**:
+   - Como no agregamos un byte extra en el header para indicar "soy Stop & Wait" o "soy SACK", el disector detecta la variante observando el **comportamiento del flujo**:
+     - **Regla 1**: si ve un paquete `OP_ACK` con `payload_len > 0` múltiplo de 4 bytes (la lista SACK), marca el flujo como `SACK`.
+     - **Regla 2**: si ve **dos paquetes `OP_DATA` con números de secuencia distintos sin ningún ACK en el medio**, deduce que hay pipelining (ventana deslizante), por lo que clasifica el flujo como `SACK`.
+     - Si nunca se cumplen estas dos condiciones, permanece como `STOPWAIT`.
+   - Una vez que un flujo pasa a `SACK`, se memoriza en `flow_mode[key] = "SACK"` (y no se borra al hacer `Ctrl+R` / recargar captura para que los primeros paquetes ya queden clasificados correctamente).
+4. **Lectura y parseo del buffer (`sw.dissector`)**:
+   - Lee campos exactos con `buffer(offset, length):uint()`.
+   - Para paquetes `START` o `ERROR`, decodifica el payload como texto legible (el nombre del archivo o el mensaje de error).
+   - Para paquetes `ACK` en SACK, recorre de a 4 bytes (`buffer:range(i * 4, 4)`) y parsea cada secuencia fuera de orden.
+
+---
+
+### C. ¿Por qué lo diseñamos así?
+1. **Inspección visual inmediata en la demo**:
+   - Sin el plugin, Wireshark solo muestra paquetes UDP con bytes hexadecimales opacos. Con el plugin, tanto el docente como nosotros podemos ver a simple vista las retransmisiones, la ventana en vuelo y los bloques SACK confirmados sin tener que interpretar bytes a mano.
+2. **Cero overhead en el protocolo (detección por inferencia)**:
+   - En lugar de gastar bytes valiosos del header de 11 bytes para indicar qué protocolo es, dejamos que el analizador de red deduzca la variante analizando las ráfagas y los payloads SACK.
+3. **Filtros de visualización nativos de Wireshark**:
+   - Al definir `ProtoField` para cada campo, nos permite filtrar en la barra de búsqueda de Wireshark con expresiones simples durante la evaluación:
+     - `stopwait.opcode == 1` (ver solo paquetes DATA).
+     - `stopwait.variant == "SACK"` (ver solo tráfico SACK).
+     - `stopwait.sack` (ver únicamente los ACKs que reportaron paquetes fuera de orden).
+     - `stopwait.seq == 42` (ver la historia y retransmisiones del paquete 42).
