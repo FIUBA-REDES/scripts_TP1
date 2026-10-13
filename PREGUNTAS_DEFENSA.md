@@ -744,3 +744,80 @@ Cliente 3 (OP_DATA) ──┘   (Hilo Principal Demux)             ├──> Qu
 | **Socket utilizado** | El socket principal compartido **`10.0.0.5:5005`**. | Un socket con **puerto efímero dedicado** por cada descarga (`sender_transport = UdpTransport()`). |
 | **Paso de paquetes** | Hilo central `serve_forever()` encola en `Session.packets` (`Queue`). | Directo: el socket efímero solo recibe los ACKs de su respectivo cliente. |
 | **Razón fundamental** | Evita que múltiples hilos compitan en `recvfrom()` sobre el puerto 5005 al recibir datos. | Evita que el bucle de envío/espera de ACKs interfiera con el socket de escucha 5005 del servidor. |
+
+
+
+
+---
+
+## 14. ¿Cuáles constantes hay en todo el TP y qué manejan? ¿Por qué decidieron esos valores?
+
+A lo largo del código de `../TP1/src/lib/` definimos constantes clave para temporizadores, límites de reintentos, tamaños de buffers y control de concurrencia:
+
+---
+
+### 1. En [`protocol.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/protocol.py) — Formato de Cabecera y Opcodes
+
+| Constante | Valor | Qué maneja | ¿Por qué decidieron ese valor? |
+| :--- | :--- | :--- | :--- |
+| `OP_START`, `OP_DATA`, `OP_ACK`, `OP_FIN`, `OP_ERROR` | `0, 1, 2, 3, 4` | Los 5 tipos de mensajes posibles del protocolo. | Permite diferenciar el propósito de cada paquete con un único byte sin ambigüedades. |
+| `OPCODE_SIZE` | `1` (byte) | Tamaño del campo opcode. | 1 byte alcanza para definir hasta 256 tipos de operaciones (solo usamos 5). |
+| `SEQ_SIZE` | `4` (bytes) | Tamaño del Sequence Number (`uint32`). | 4 bytes permiten contar hasta $2^{32}-1 pprox 4.29 	imes 10^9$ bloques. Con bloques de 1 KB, permite transferir archivos de hasta **~4 TB sin wrap-around** de secuencias. |
+| `ACK_SIZE` | `4` (bytes) | Tamaño del Acknowledgment Number (`uint32`). | Idéntico a `SEQ_SIZE` para poder confirmar cualquier bloque de la secuencia en SACK y mantener el encabezado simétrico. |
+| `LENGTH_SIZE` | `2` (bytes) | Tamaño del campo que indica la longitud del payload (`uint16`). | 2 bytes permiten especificar longitudes de hasta $65.535$ bytes, cubriendo holgadamente el payload máximo de datos (1024 B) o listas SACK. |
+| `HEADER_SIZE` | `11` (bytes) | Longitud total fija del encabezado (`1 + 4 + 4 + 2`). | Es la suma exacta de los campos anteriores. Muy bajo overhead frente al bloque de datos (~1%). |
+
+---
+
+### 2. En [`sack.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/sack.py) — Selective Repeat / SACK
+
+| Constante | Valor | Qué maneja | ¿Por qué decidieron ese valor? |
+| :--- | :--- | :--- | :--- |
+| `CHUNK_SIZE` | `1024` (bytes) | Cantidad de bytes del archivo que viajan en el payload de cada paquete `OP_DATA`. | **Evita la fragmentación IP**: Con `1024B (payload) + 11B (TP1) + 8B (UDP) + 20B (IP) = 1063 bytes`, queda holgadamente por debajo del **MTU estándar de Ethernet (1500 bytes)**. Si el datagrama superara 1500 bytes, IP fragmentaría el paquete en 2 fragmentos físicos, duplicando la tasa de pérdida en la red. |
+| `WINDOW_SIZE` | `32` (paquetes) | Tamaño de la ventana deslizante emisora en Selective Repeat. | Determina el pipelining: permite hasta **32 KB en vuelo** ($32 	imes 1024$ B). Con un RTT de 40 ms, permite un throughput teórico de $pprox rac{32	ext{ KB}}{0.04	ext{ s}} = 800	ext{ KB/s}$, suficiente para transferir 5 MB en **~7 a 10 segundos** (cumpliendo sobradamente el requisito del enunciado de $< 2$ minutos). No se usó un valor más grande para no saturar colas ni generar congestión en Mininet. |
+| `SACK_SIZE` | `4` (bytes) | Tamaño de cada número de secuencia dentro de la lista SACK del payload. | Mismo tamaño que `SEQ_SIZE` (un `uint32` en big-endian) para identificar unívocamente cada paquete recibido fuera de orden. |
+| `INITIAL_RTO` | `0.5` (segundos) | *Retransmission Timeout* para reenviar paquetes no confirmados. | Con un RTT de red de **40 ms** (0.04 s), un RTO de **500 ms** es más de 12 veces el RTT normal. Esto previene **retransmisiones espurias o prematuras** causadas por jitter o demoras transitorias de procesamiento en Mininet, pero reacciona lo suficientemente rápido para recuperar pérdidas sin frenar la transferencia. |
+| `MAX_TRIES` | `12` | Cantidad máxima de reintentos antes de abortar la transferencia. | Con una tasa de pérdida configurada de **10%** ($p = 0.10$), la probabilidad de que un paquete se pierda 12 veces consecutivas es extremadamente baja: $0.10^{12} = 10^{-12}$ (1 en un billón). Garantiza que solo aborte si la conexión realmente se cayó. |
+| `ACK_POLL_TIMEOUT`| `0.02` (20 ms) | Tiempo máximo de espera en `select.select` leyendo ACKs entre iteraciones del bucle de envío. | Corresponde a la mitad de un RTT típico (40 ms). Permite vaciar todos los ACKs acumulados en el buffer del socket sin quedarse bloqueado cuando no hay más ACKs para leer, manteniendo el emisor ágil. |
+| `FIN_ACK_WAIT` | `0.05` (50 ms) | Timeout esperando el ACK del paquete `OP_FIN`. | Apenas por encima de 1 RTT (40 ms) para retransmitir rápido el `OP_FIN` si se perdió y no demorar el cierre de la conexión. |
+| `FIN_RETRY_WAIT` | `0.2` (200 ms) | Tiempo que el receptor espera paquetes FIN repetidos tras completar la descarga. | Permite responder rápidamente si el emisor reenvía el `FIN` porque no le llegó el primer ACK. |
+| `FIN_GRACE_PERIOD`| `1.0` (segundo) | Duración total de la espera activa post-FIN en el receptor (*TIME_WAIT*). | Es el doble de `INITIAL_RTO` (0.5s). Asegura que si el último ACK del emisor se perdió y este reintenta enviar el `FIN`, el receptor siga vivo para confirmarlo y evitar que el emisor aborte con error. |
+| `POLL_SLEEP` | `0.01` (10 ms) | Tiempo de sleep en el polling cuando se usan transportes simulados (mocks en tests). | Evita el consumo de CPU al 100% en bucles de prueba unitaria sin socket real. |
+
+---
+
+### 3. En [`stop_and_wait.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/stop_and_wait.py) — Stop & Wait
+
+| Constante | Valor | Qué maneja | ¿Por qué decidieron ese valor? |
+| :--- | :--- | :--- | :--- |
+| `CHUNK_SIZE` | `1024` (bytes) | Tamaño del bloque de datos. | Mismo criterio que en SACK: debajo del MTU de 1500 B para evitar fragmentación IP. |
+| `MAX_TRIES` | `5` | Límite de reintentos por paquete. | En Stop & Wait el socket bloquea 1.0s por intento. Con 5 intentos espera hasta 5 segundos antes de abortar, tiempo suficiente para tolerar pérdidas esporádicas sin colgar el proceso indefinidamente si el servidor se apaga. |
+| `FIN_TIMEOUT` | `0.5` (segundos) | Timeout de socket esperando posibles FIN duplicados al cerrar. | Da un margen de medio segundo para responder ACKs rezagados del FIN antes de que el receptor libere sus recursos. |
+
+---
+
+### 4. En [`session.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/session.py) — Sesiones del Servidor
+
+| Constante | Valor | Qué maneja | ¿Por qué decidieron ese valor? |
+| :--- | :--- | :--- | :--- |
+| `TIMEOUT` | `5` (segundos) | Timeout en `self.packets.get(timeout=TIMEOUT)` de la cola de la sesión. | Si un cliente se desconecta abruptamente a mitad de una subida sin mandar `OP_FIN` ni paquetes de error, el worker no se queda bloqueado para siempre en la cola: a los 5 segundos salta la excepción `queue.Empty`, la sesión se marca como abortada (`self.aborted = True`), se eliminan los buffers de memoria y se libera el worker del thread pool. |
+
+---
+
+### 5. En [`file_transfer_server.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/file_transfer_server.py) — Servidor Multihilo
+
+| Constante / Parámetro | Valor | Qué maneja | ¿Por qué decidieron ese valor? |
+| :--- | :--- | :--- | :--- |
+| `max_workers` | `10` | Cantidad máxima de hilos en `ThreadPoolExecutor`. | La prueba de concurrencia de la cátedra pide soportar **4 clientes simultáneos** (2 uploads + 2 downloads). Con 10 workers podemos atender holgadamente esas 4 transferencias en paralelo y tener margen para nuevas conexiones o transferencias simultáneas sin agotar los hilos del pool. |
+| `port` (por defecto) | `5005` | Puerto UDP por defecto de escucha del servidor. | Está dentro del rango de puertos no privilegiados (> 1023) y fuera de los puertos conocidos de servicios estándar (evita conflictos y no requiere privilegios de root para abrir el socket). |
+
+---
+
+### 6. En [`args_verifier.py`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/args_verifier.py) — Validación de Argumentos
+
+| Constante | Valor | Qué maneja | ¿Por qué decidieron ese valor? |
+| :--- | :--- | :--- | :--- |
+| `LAST_WELL_KNOWN_PORT` | `1023` | Límite superior de los puertos bien conocidos del sistema. | Los puertos 0 a 1023 son reservados por IANA para servicios del sistema operativo (root). Obliga a usar puertos de usuario. |
+| `MAX_PORT` | `65535` | Puerto UDP máximo representable. | Es el límite de un entero de 16 bits sin signo en el encabezado UDP ($2^{16}-1$). |
+| `COLLECTION_OF_NOT_KNOWN_USED_PORTS` | `(8080,)` | Tupla de puertos prohibidos/restringidos. | Evita colisionar con proxies web comunes o servidores HTTP de desarrollo. |
+| `VALID_PROTOCOLS` | `("sw", "sack")` | Lista de nombres de protocolos válidos por línea de comandos. | Valida estrictamente que el usuario elija únicamente entre Stop & Wait (`sw`) y Selective Repeat (`sack`). |
