@@ -298,3 +298,381 @@ Nuestra extensión es un **disector de Wireshark escrito en Lua** ([`../TP1/src/
      - `stopwait.variant == "SACK"` (ver solo tráfico SACK).
      - `stopwait.sack` (ver únicamente los ACKs que reportaron paquetes fuera de orden).
      - `stopwait.seq == 42` (ver la historia y retransmisiones del paquete 42).
+     
+---
+
+## 11. ¿Qué hacen paso a paso en la extensión de Lua (con sintaxis y todo)?
+
+El código completo está en [`../TP1/src/lib/mi_plugin.lua`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/mi_plugin.lua). A continuación se explica línea por línea cada bloque de la API de Lua para Wireshark:
+
+### Paso 1: Constantes y definición del protocolo
+```lua
+local HEADER_SIZE = 11
+local SACK_ENTRY_SIZE = 4   -- cada elemento de la lista SACK es un seq de 4 bytes
+
+local OP_START, OP_DATA, OP_ACK, OP_FIN, OP_ERROR = 0, 1, 2, 3, 4
+
+local sw = Proto("stopwait", "Protocolo Stop and Wait / SACK")
+
+local opcode_names = {
+    [OP_START] = "START",
+    [OP_DATA]  = "DATA",
+    [OP_ACK]   = "ACK",
+    [OP_FIN]   = "FIN",
+    [OP_ERROR] = "ERROR",
+}
+```
+- **`Proto(nombre, descripcion)`**: es la función de la API de Wireshark que crea un nuevo protocolo. `stopwait` es el nombre interno que se usa para los filtros de visualización (ej: `stopwait.opcode == 1`).
+- **`opcode_names`**: es una tabla (diccionario de Lua) que mapea el valor entero del opcode a su nombre legible.
+
+---
+
+### Paso 2: Declaración de los campos (`ProtoField`)
+```lua
+local f_variant = ProtoField.string("stopwait.variant", "Variante")
+local f_opcode  = ProtoField.uint8("stopwait.opcode", "Opcode", base.DEC, opcode_names)
+local f_seq     = ProtoField.uint32("stopwait.seq", "Sequence Number", base.DEC)
+local f_ack     = ProtoField.uint32("stopwait.ack", "Acknowledgment Number", base.DEC)
+local f_len     = ProtoField.uint16("stopwait.payload_len", "Payload Length", base.DEC)
+local f_payload = ProtoField.bytes("stopwait.payload", "Payload")
+local f_text    = ProtoField.string("stopwait.payload_text", "Payload (texto)")
+local f_sack    = ProtoField.uint32("stopwait.sack", "Seq recibido fuera de orden", base.DEC)
+
+sw.fields = { f_variant, f_opcode, f_seq, f_ack, f_len, f_payload, f_text, f_sack }
+```
+- **`ProtoField.<tipo>(filtro, etiqueta, [base], [tabla_nombres])`**: define cómo Wireshark interpreta cada campo en el árbol de disección y qué nombre de filtro le asigna:
+  - `uint8`, `uint16`, `uint32`: leen enteros sin signo de 1, 2 o 4 bytes. `base.DEC` indica que se muestran en base decimal.
+  - Al pasarle `opcode_names` al `uint8`, Wireshark muestra automáticamente `DATA (1)` en vez de un simple `1`.
+- **`sw.fields = { ... }`**: registra formalmente todos los campos dentro del protocolo.
+
+---
+
+### Paso 3: Alertas visuales (*Expert Info*)
+```lua
+local ef_bad_opcode = ProtoExpert.new("stopwait.bad_opcode", "Opcode invalido",
+    expert.group.MALFORMED, expert.severity.WARN)
+local ef_bad_len = ProtoExpert.new("stopwait.bad_length",
+    "La longitud del payload no coincide con los bytes recibidos",
+    expert.group.MALFORMED, expert.severity.ERROR)
+
+sw.experts = { ef_bad_opcode, ef_bad_len }
+```
+- **`ProtoExpert.new(...)`**: genera advertencias coloreadas en Wireshark (panel de información experta) si se captura un paquete con opcode desconocido o si el payload fue truncado.
+
+---
+
+### Paso 4: Seguimiento del flujo y detección automática de variante
+```lua
+local flow_mode = {}   -- flow_mode[flujo] = "SACK"
+local pending = {}     -- pending[flujo] = seq del ultimo DATA/FIN todavia sin ACK
+
+function sw.init()
+    pending = {}
+end
+
+local function flow_key(pinfo)
+    local a = tostring(pinfo.src) .. ":" .. tostring(pinfo.src_port)
+    local b = tostring(pinfo.dst) .. ":" .. tostring(pinfo.dst_port)
+    if a < b then
+        return a .. "|" .. b
+    end
+    return b .. "|" .. a
+end
+
+local function update_evidence(key, opcode, seq, payload_len)
+    if flow_mode[key] == "SACK" then
+        return
+    end
+
+    if opcode == OP_ACK then
+        if payload_len > 0 and payload_len % SACK_ENTRY_SIZE == 0 then
+            flow_mode[key] = "SACK"
+        end
+        pending[key] = nil
+    elseif opcode == OP_DATA or opcode == OP_FIN then
+        if pending[key] ~= nil and pending[key] ~= seq then
+            flow_mode[key] = "SACK"
+        end
+        pending[key] = seq
+    end
+end
+```
+- **`sw.init()`**: Wireshark la llama al cargar o reiniciar una captura. Vaciamos `pending` pero conservamos `flow_mode` para que al recargar (`Ctrl+R`) los primeros paquetes mantengan su variante deducida.
+- **`flow_key(pinfo)`**: `pinfo` es el objeto *Packet Information* provisto por Wireshark (`pinfo.src`, `pinfo.src_port`, etc.). Al ordenar alfabéticamente `a` y `b`, los paquetes de ida y vuelta comparten exactamente la misma clave de flujo.
+- **`update_evidence(...)`**:
+  - Si un ACK trae payload múltiplo de 4 bytes -> es la lista SACK -> marca `SACK`.
+  - Si ve un `DATA` o `FIN` con número de secuencia distinto al anterior sin que haya llegado un ACK en el medio -> hay múltiples paquetes en vuelo (pipelining) -> marca `SACK`.
+
+---
+
+### Paso 5: La función Dissector (`sw.dissector`)
+```lua
+function sw.dissector(buffer, pinfo, tree)
+    local total = buffer:len()
+    if total < HEADER_SIZE then
+        return 0
+    end
+```
+- **Parámetros obligatorios del dissector**:
+  - `buffer`: un objeto `Tvb` (*Testy Virtual Buffer*) con los bytes crudos del payload UDP.
+  - `pinfo`: metadatos del paquete (columnas, protocolo, IPs, puertos).
+  - `tree`: la raíz del árbol visual de disección de Wireshark.
+- Si `buffer:len() < 11`, retorna 0 indicando que no es un paquete válido de nuestro protocolo.
+
+#### Parseo de los campos fijos del header:
+```lua
+    local opcode      = buffer(0, 1):uint()
+    local seq         = buffer(1, 4):uint()
+    local ack         = buffer(5, 4):uint()
+    local payload_len = buffer(9, 2):uint()
+```
+- **Sintaxis `buffer(offset, length):uint()`**: es un slice del buffer llamado `TvbRange`. `buffer(0, 1):uint()` extrae 1 byte en offset 0 como entero sin signo; `buffer(1, 4):uint()` extrae 4 bytes como entero big-endian de 32 bits.
+
+#### Deducción y actualización de la columna de protocolo:
+```lua
+    local key = flow_key(pinfo)
+    if not pinfo.visited then
+        update_evidence(key, opcode, seq, payload_len)
+    end
+    local variant = flow_mode[key] or "STOPWAIT"
+    local is_sack = (variant == "SACK")
+
+    pinfo.cols.protocol = variant
+```
+- `not pinfo.visited`: asegura que la evidencia solo se analice en la primera pasada de captura, evitando falsos positivos al hacer scroll en Wireshark.
+- `pinfo.cols.protocol = variant`: cambia la columna "Protocol" de Wireshark de `UDP` a `STOPWAIT` o `SACK`.
+
+#### Creación del árbol en la interfaz gráfica:
+```lua
+    local title = is_sack and "Protocolo SACK" or "Protocolo Stop and Wait"
+    local subtree = tree:add(sw, buffer(), title)
+    subtree:add(f_variant, buffer(0, 0), variant):set_generated()
+
+    local op_item  = subtree:add(f_opcode, buffer(0, 1))
+    local seq_item = subtree:add(f_seq, buffer(1, 4))
+    local ack_item = subtree:add(f_ack, buffer(5, 4))
+    local len_item = subtree:add(f_len, buffer(9, 2))
+```
+- **`tree:add(sw, buffer(), title)`**: crea la rama principal desplegable del protocolo.
+- **`subtree:add(ProtoField, TvbRange)`**: asocia visualmente cada campo con los bytes resaltados en el panel hexadecimal inferior de Wireshark.
+- **`:set_generated()`**: marca que el campo `variant` fue deducido por el disector y no leído directamente de los bytes del paquete.
+
+#### Parseo dinámico del Payload (y de la lista SACK):
+```lua
+    local sack_list = {}
+    local shown = math.min(payload_len, available)
+    if shown > 0 then
+        local payload_range = buffer(HEADER_SIZE, shown)
+
+        if opcode == OP_ACK and shown % SACK_ENTRY_SIZE == 0 then
+            local count = math.floor(shown / SACK_ENTRY_SIZE)
+            local sack_tree = subtree:add(payload_range,
+                string.format("Lista SACK: %d paquete(s) recibido(s) fuera de orden", count))
+            for i = 0, count - 1 do
+                local entry = payload_range:range(i * SACK_ENTRY_SIZE, SACK_ENTRY_SIZE)
+                sack_tree:add(f_sack, entry)
+                sack_list[#sack_list + 1] = entry:uint()
+            end
+        else
+            subtree:add(f_payload, payload_range)
+            if opcode == OP_START or opcode == OP_ERROR then
+                subtree:add(f_text, payload_range)
+            end
+        end
+    end
+```
+- Si es un `OP_ACK` con payload: divide la longitud por 4, crea una subrama `Lista SACK` y va agregando cada bloque de 4 bytes como un campo `f_sack`.
+- Si es `OP_START` o `OP_ERROR`: agrega el campo `f_text` para que el nombre del archivo o el mensaje de error se lea directamente en ASCII en el árbol.
+
+#### Formateo de la columna Info:
+```lua
+    local name = opcode_names[opcode] or ("OP?" .. opcode)
+    local info = string.format("%s  Seq=%d  Ack=%d  Len=%d", name, seq, ack, payload_len)
+    if #sack_list > 0 then
+        info = info .. "  SACK=[" .. table.concat(sack_list, ",") .. "]"
+    end
+    pinfo.cols.info = info
+
+    return total
+end
+```
+- `pinfo.cols.info`: reemplaza la columna "Info" de Wireshark con un resumen legible del datagrama.
+- `return total`: le indica a Wireshark la cantidad total de bytes consumidos de este paquete.
+
+---
+
+### Paso 6: Registro en la tabla de puertos UDP
+```lua
+local udp_table = DissectorTable.get("udp.port")
+udp_table:add(5005, sw)
+```
+- Obtiene la tabla de disectores de puertos UDP (`DissectorTable.get("udp.port")`) y asocia nuestro protocolo `sw` al puerto `5005`. Así, todo tráfico UDP hacia o desde el puerto 5005 es despachado automáticamente a `sw.dissector`.
+
+---
+
+## 12. ¿Cómo funciona el header, es cabecera de qué? ¿Qué otras clases hay y cómo están relacionadas?
+
+### A. ¿Cómo funciona el header y cabecera de qué es?
+- **Es cabecera de Capa de Aplicación sobre Capa de Transporte (UDP)**.
+- Nuestro protocolo viaja encapsulado como el **payload de los datagramas UDP**:
+  ```text
+  ┌─────────────────┬──────────────┬───────────────┬───────────────────────────────┐
+  │ Ethernet Header │  IP Header   │  UDP Header   │        Payload de UDP         │
+  │    (14 bytes)   │  (20 bytes)  │   (8 bytes)   │   (Nuestro Protocolo TP1)     │
+  └─────────────────┴──────────────┴───────────────┴───────────────────────────────┘
+                                                   │                               │
+                                                   ▼                               ▼
+                                                   ┌─────────────────┬─────────────┐
+                                                   │ Header TP1 (11B)│ Payload TP1 │
+                                                   └─────────────────┴─────────────┘
+  ```
+- **Estructura del Header (11 bytes en Big-Endian)**:
+  1. **`opcode` (1 byte, `uint8`, offsets 0..0)**:
+     - `0`: `OP_START` (inicio de sesión / handshake, payload lleva el nombre de archivo).
+     - `1`: `OP_DATA` (fragmento del archivo, payload lleva hasta 1024 bytes).
+     - `2`: `OP_ACK` (confirmación, payload vacío o lista SACK de secuencias fuera de orden).
+     - `3`: `OP_FIN` (fin de archivo, payload vacío).
+     - `4`: `OP_ERROR` (mensaje de error descriptivo en payload).
+  2. **`seq_num` (4 bytes, `uint32`, offsets 1..4)**:
+     - Identifica el número del paquete/bloque dentro de la transferencia (`0, 1, ..., N-1` y `N` para `FIN`).
+  3. **`ack_num` (4 bytes, `uint32`, offsets 5..8)**:
+     - En `OP_ACK`: representa el número de secuencia acumulativo esperado (`next_seq`). En paquetes de datos de SACK se completa en `0`.
+  4. **`payload_len` (2 bytes, `uint16`, offsets 9..10)**:
+     - Tamaño en bytes del payload que viene a continuación (`0` a `1024`, o múltiplos de 4 en lista SACK). Permite validar integridad y prevenir desbordes de buffer.
+
+---
+
+### B. ¿Qué clases componen el sistema y cómo están relacionadas?
+
+El sistema está diseñado en capas modulares dentro de `../TP1/src/lib/`:
+
+```mermaid
+classDiagram
+    direction TB
+
+    class Packet {
+        +int opcode
+        +int seq_num
+        +int ack_num
+        +int payload_len
+        +bytes payload
+        +encode() bytes
+        +decode(raw_bytes) Packet
+        +sack_ack(next_seq, received) Packet
+        +decode_sack(packet) tuple
+    }
+
+    class UdpTransport {
+        -socket socket
+        +bind(host, port)
+        +send(packet, address)
+        +receive(buffer_size) tuple
+        +try_receive(buffer_size) tuple
+        +set_timeout(timeout)
+        +close()
+    }
+
+    class StopAndWait {
+        +send(transport, file_path, server_address) bool
+        +receive(transport, destination_path, server_address) bool
+    }
+
+    class SelectiveRepeat {
+        +send(transport, file_path, server_address) bool
+        +receive(transport, destination_path, server_address) bool
+        -receive_acks(...)
+        -check_timeouts_and_retransmit(...)
+        -_encode_sack(sequences) bytes
+        -_decode_sack(payload) set
+    }
+
+    class FileTransferClient {
+        -tuple server_address
+        -UdpTransport transport
+        -bool connected
+        +connect(remote_name) bool
+        +upload(source_path, remote_name, protocol)
+        +download(destination_path, remote_name, protocol)
+        +close()
+    }
+
+    class FileTransferServer {
+        -tuple address
+        -UdpTransport transport
+        -dict sessions
+        -ThreadPoolExecutor executor
+        -Lock lock
+        +start()
+        +serve_forever()
+        +handle_packet(packet, client_address)
+        -_worker_task(...)
+        +stop()
+    }
+
+    class Session {
+        -UdpTransport transport
+        -tuple client_address
+        -Queue packets
+        -dict chunks
+        -bytearray buffer
+        -int next_seq
+        -bool completed
+        +start_session(packet)
+        +enqueue(packet)
+        +process_packets()
+        +update_session(packet)
+        +complete_transfer()
+    }
+
+    UdpTransport ..> Packet : serializa/deserializa
+    FileTransferClient --> UdpTransport : compone
+    FileTransferClient ..> StopAndWait : delega
+    FileTransferClient ..> SelectiveRepeat : delega
+
+    FileTransferServer --> UdpTransport : socket principal (5005)
+    FileTransferServer "1" *-- "*" Session : gestiona sesiones
+    FileTransferServer ..> StopAndWait : en _worker_task (download)
+    FileTransferServer ..> SelectiveRepeat : en _worker_task (download)
+
+    Session --> UdpTransport : envía ACKs
+    Session ..> Packet : procesa
+```
+
+### Detalle de cada clase y su rol:
+
+1. **[`Packet`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/protocol.py)**:
+   - Modela la unidad de datos de protocolo (PDU).
+   - Métodos principales:
+     - `encode()`: serializa los campos al formato binario de 11 bytes + payload.
+     - `decode()`: valida longitudes y opcodes, y reconstruye el objeto `Packet`.
+     - `sack_ack()` / `decode_sack()`: codifica y decodifica la lista de números fuera de orden en el payload.
+
+2. **[`UdpTransport`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/transport.py)**:
+   - Capa de abstracción de red sobre el `socket.socket(AF_INET, SOCK_DGRAM)`.
+   - Se encarga de llamar a `packet.encode()` antes de `sendto()`, y de llamar a `Packet.decode()` tras `recvfrom()`.
+   - Maneja los timeouts de socket capturando `socket.timeout` y devolviendo `(None, None)`.
+
+3. **[`StopAndWait`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/stop_and_wait.py)**:
+   - Implementa la lógica sin pipelining (1 paquete a la vez).
+   - Métodos estáticos puros: `send()` y `receive()`. Reciben un `UdpTransport`, la ruta del archivo y la dirección remota. No guardan estado propio en instancias, lo que facilita su reutilización tanto en cliente como en servidor.
+
+4. **[`SelectiveRepeat`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/sack.py)**:
+   - Implementa la lógica con pipelining (ventana de 32 paquetes y selective repeat).
+   - Métodos estáticos principales: `send()` (maneja la ventana emisora `WINDOW_SIZE=32`, el polling de ACKs y el RTO) y `receive()` (maneja el buffer de recepción `chunks` fuera de orden y los ACKs con payloads SACK).
+
+5. **[`FileTransferClient`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/file_transfer_client.py)**:
+   - Fachada de cliente de alto nivel utilizada por los ejecutables de consola `upload` y `download`.
+   - Compone un `UdpTransport`.
+   - En `upload()`: hace el handshake con `connect()` y delega en `StopAndWait.send()` o `SelectiveRepeat.send()`.
+   - En `download()`: manda `DOWNLOAD:protocol:remote_name` en el handshake y delega en `StopAndWait.receive()` o `SelectiveRepeat.receive()`.
+
+6. **[`FileTransferServer`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/file_transfer_server.py)**:
+   - El daemon servidor multihilo que escucha en `10.0.0.5:5005`.
+   - Mantiene la tabla `self.sessions` protegida por `self.lock`.
+   - En `serve_forever()` corre el bucle demultiplexor de paquetes UDP.
+   - Administra el `ThreadPoolExecutor(max_workers=10)` donde corren las tareas de cada cliente.
+
+7. **[`Session`](file:///home/rbarcala/MEGA/Redes/TP1/src/lib/session.py)**:
+   - Representa el estado de una transferencia de subida (*UPLOAD*) de un cliente específico.
+   - Tiene su propia cola interna de paquetes `self.packets = Queue()`.
+   - Su método `process_packets()` corre en un hilo de trabajo separado, consumiendo de la cola, manteniendo el estado de ensamblado (`self.chunks` y `self.buffer`), respondiendo los `OP_ACK` y persistiendo el archivo final en disco al recibir el `OP_FIN`.
